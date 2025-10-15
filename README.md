@@ -1,36 +1,521 @@
-ble_attendance — BLE-based attendance logger for ESP32
+# BLE Attendance System — ESP32 Scanner + App Backend
 
-Overview
---------
-This is a small ESP32 Arduino project that scans nearby Bluetooth Low Energy (BLE) advertisement packets and records "IN" and "OUT" attendance events for a small, pre-approved list of device names. The sketch (`ble_attendance.ino`) connects the ESP32 to Wi-Fi and sends attendance events to a Google Apps Script URL which can write to Google Sheets.
+## Current Working (ESP32 Side)
 
-Key files
----------
-- `ble_attendance.ino` — main Arduino sketch. Scans BLE, maintains in-memory presence map, and logs IN/OUT events via HTTP to a Google Apps Script endpoint.
+### What the ESP32 does
+The `ble_attendance.ino` sketch implements a BLE proximity-based attendance logger:
 
-How it works (quick)
---------------------
-- On startup the ESP32 connects to Wi-Fi.
-- BLE scan runs in repeated intervals (configured by `scanTime`).
-- If a device from the whitelist (allowed devices) is detected and was previously absent, the sketch logs an "IN" event.
-- If a device that was previously present is not seen in the current scan, it logs an "OUT" event.
-- Events are sent using HTTP GET requests to the configured `GOOGLE_SCRIPT_URL`.
+1. **BLE Scanning**: ESP32 continuously scans for nearby Bluetooth Low Energy (BLE) advertisement packets every `scanTime` seconds (default: 5 seconds).
 
-Configuration
--------------
-Edit the top of `ble_attendance.ino` to set your Wi-Fi credentials and Google Apps Script URL. Update the `allowedDevices` array with the device names you want to track.
+2. **Name Matching**: For each detected BLE device, the ESP extracts the advertised device name and checks if it matches any entry in the hardcoded `allowedDevices[]` whitelist array.
 
-Limitations & assumptions
--------------------------
-- The sketch uses device advertisement name string matching. Many BLE devices do not include a stable advertising name or may randomize addresses — this only works reliably for devices that advertise a consistent name.
-- Presence is determined per-scan. The timeout and scan interval settings influence sensitivity to short absences.
-- The Google Apps Script endpoint is assumed to accept unauthenticated GET requests. For production, replace with a secure backend.
+3. **Walk-IN Detection**: When a whitelisted device appears for the first time (not previously marked as present), the ESP logs a "Walk-IN" event.
 
-Concise analysis — ways to handle, interpret, and record attendance data
-------------------------------------------------------------------------
-This section compares practical options you can use for storing and managing the whitelist and attendance logs. Each option has short pros/cons, complexity, cost, real-time capability, and recommended use-cases.
+4. **Walk-OUT Detection**: After each scan cycle, if a device that was previously present is no longer detected, the ESP logs a "Walk-OUT" event.
 
-1) Google Sheets (Apps Script)
+5. **Remote Logging**: Events are sent via HTTP GET request to a Google Apps Script URL (`GOOGLE_SCRIPT_URL`) in the format:
+   ```
+   ?device=MihirPhone&action=IN
+   ```
+
+6. **In-Memory State**: The ESP maintains a presence map (`devicePresence`) in RAM. All state is lost on reboot.
+
+### Technical details (ESP32)
+- **BLE Library**: Uses ESP32's native `BLEDevice`, `BLEScan`, and `BLEAdvertisedDevice` APIs
+- **Scan Configuration**: 
+  - Active scan mode (requests scan response packets)
+  - Scan interval: 100ms, scan window: 99ms
+  - Scan duration: configurable via `scanTime` (default 5 seconds)
+- **Whitelist**: Hardcoded string array `allowedDevices[]` = `{"MihirPhone", "RaviWatch", "NehaLaptop"}`
+- **Logging**: HTTP GET to Google Apps Script (unauthenticated, no retry logic)
+- **No Persistence**: Presence state and logs are not stored locally; reboots reset everything
+
+### Key files
+- `ble_attendance.ino` — complete Arduino sketch for ESP32
+
+### Current limitations
+- **Hardcoded whitelist**: Device names are compiled into firmware
+- **No authentication**: Google Apps Script URL is open; anyone with the URL can spam logs
+- **Name-based only**: Relies on BLE devices advertising a stable "Complete Local Name" — many modern phones randomize MAC addresses and may not advertise names consistently
+- **No offline buffering**: Failed HTTP requests are dropped
+- **Reboot loses state**: All presence information is lost on power cycle
+
+---
+
+## What the Mobile App Must Do (For ESP to Detect Phones)
+
+For employee phones to be detected by the ESP32 scanner, the mobile app must configure BLE advertising correctly. Here's what app developers need to implement:
+
+### Required: BLE Advertising with "Complete Local Name"
+
+The ESP32 scans for BLE advertisement packets and matches against the **Complete Local Name** field. The mobile app must:
+
+1. **Enable BLE Advertising** (not just scanning)
+   - Use platform-specific APIs:
+     - **Android**: `BluetoothLeAdvertiser` class
+     - **iOS**: `CBPeripheralManager` with advertising enabled
+   - **React Native**: Use libraries like `react-native-ble-manager` or `react-native-ble-plx` (advertising support varies)
+   - **Flutter**: Use `flutter_blue_plus` or `flutter_reactive_ble` with advertiser mode
+
+2. **Set the "Complete Local Name" in advertisement packet**
+   - This field must contain the exact string that matches the whitelist on the ESP (e.g., `"MihirPhone"`)
+   - The name should be unique per employee
+   - **Important**: The match is case-sensitive as currently implemented
+
+3. **Keep advertising active**
+   - Advertising should run continuously (or at least periodically) while the app is in foreground/background
+   - Use platform-specific background modes and permissions to keep advertising alive when app is backgrounded
+
+### Platform-specific implementation notes
+
+#### Android
+- Use `BluetoothLeAdvertiser.startAdvertising()` with `AdvertiseData` containing:
+  - `setIncludeDeviceName(true)` OR manually add name via `addServiceData()` or manufacturer data
+  - Alternatively, use `AdvertiseData.Builder().setIncludeDeviceName(true)` and ensure the Bluetooth adapter name is set to the employee's identifier
+- **Permissions required**: `BLUETOOTH_ADVERTISE` (Android 12+), `BLUETOOTH`, `BLUETOOTH_ADMIN` (older)
+- **Background considerations**: Requires `ACCESS_BACKGROUND_LOCATION` on some Android versions; advertising may be throttled
+
+#### iOS
+- Use `CBPeripheralManager` and call `startAdvertising()` with `CBAdvertisementDataLocalNameKey` set to the employee's identifier
+- **Permissions required**: `NSBluetoothAlwaysUsageDescription` in Info.plist
+- **Background considerations**: Enable "Uses Bluetooth LE accessories" background mode; iOS may restrict advertising in background
+
+#### Cross-platform (React Native / Flutter)
+- Advertising support is limited in many BLE libraries; verify library capabilities before choosing
+- May require native bridge code for full advertising control
+- Consider using native modules if library doesn't expose advertising APIs
+
+### Testing with nRF Connect (for developers)
+
+Before building the app, test BLE detection using the **nRF Connect** app:
+
+1. Open nRF Connect and go to the **Advertiser** tab
+2. Create a new advertiser profile:
+   - **Display name**: Any friendly name (e.g., "Mihir")
+   - **Advertising data**: Add record → Select **"Complete Local Name"** → Enter the exact whitelist name (e.g., "MihirPhone")
+   - **Options**: Enable **"Connectable"** and **"Discoverable"**
+3. Start advertising
+4. Run the ESP32 sketch and check Serial Monitor for "Walk-IN detected: MihirPhone"
+5. Stop advertising and verify "Walk-OUT detected: MihirPhone" appears after the next scan cycle
+
+### App workflow for employees
+1. Employee opens the app and logs in (authenticate user)
+2. App fetches the employee's assigned BLE identifier from backend (e.g., "MihirPhone")
+3. App starts BLE advertising with that identifier as the "Complete Local Name"
+4. Employee keeps the app running (foreground or background) while at work
+5. ESP detects the phone and logs IN/OUT events automatically
+6. App can display today's attendance status, history, and notifications
+
+### Important considerations for app developers
+- **Battery impact**: Continuous BLE advertising drains battery; implement power-saving modes or periodic advertising
+- **Name collisions**: Ensure each employee has a unique BLE identifier; use a naming convention like `"FirstnamePhone"` or assign UUIDs
+- **Platform restrictions**: iOS and Android have different background advertising capabilities; test on real devices
+- **Fallback for non-advertising devices**: Some devices may not support advertising (especially older iOS versions); consider alternative check-in methods (QR code, NFC, manual)
+
+---
+
+## Making the Whitelist Dynamic (Replace Hardcoded Names)
+
+Currently, `allowedDevices[]` is hardcoded in the firmware. Here are practical methods to make it dynamic, ordered by implementation complexity:
+
+### Option 1: Fetch from Google Sheets via Apps Script (Quickest)
+
+**How it works:**
+- Store employee BLE identifiers in a Google Sheet (one column: `DeviceName`)
+- Create a Google Apps Script that reads the sheet and returns JSON:
+  ```javascript
+  function doGet(e) {
+    const sheet = SpreadsheetApp.openById('SHEET_ID').getSheetByName('Devices');
+    const data = sheet.getRange('A2:A').getValues().flat().filter(String);
+    return ContentService.createTextOutput(JSON.stringify({ devices: data }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+  ```
+- ESP32 fetches this endpoint at boot (and optionally every 15 minutes)
+
+**ESP32 implementation:**
+- Add `ArduinoJson` library
+- HTTP GET request to Apps Script URL
+- Parse JSON and populate `allowedDevices[]` dynamically
+- Keep hardcoded array as fallback if fetch fails
+
+**Pros:** Very fast to set up, no server needed, familiar Google Sheets interface  
+**Cons:** Not real-time, rate limits, no auth by default  
+**Best for:** Small teams, proof-of-concept
+
+### Option 2: REST API + Database (Recommended for Production)
+
+**How it works:**
+- Build a backend API with endpoint: `GET /api/allowed-devices`
+- Returns JSON: `{ "devices": ["MihirPhone", "RaviWatch", ...] }`
+- Backend reads from a database (Postgres, MySQL, MongoDB, Firebase)
+
+**ESP32 implementation:**
+- HTTP GET with optional API key in header: `Authorization: Bearer <token>`
+- Parse JSON response
+- Cache last successful response in SPIFFS/LittleFS for offline fallback
+
+**Pros:** Secure, scalable, real-time updates, integrates with employee management system  
+**Cons:** Requires backend development and hosting  
+**Best for:** Production systems with multiple ESPs and employees
+
+**Database schema example:**
+```sql
+CREATE TABLE employees (
+  id SERIAL PRIMARY KEY,
+  name VARCHAR(100),
+  ble_identifier VARCHAR(50) UNIQUE,
+  is_active BOOLEAN DEFAULT TRUE
+);
+```
+
+API returns only `ble_identifier` where `is_active = TRUE`.
+
+### Option 3: Firebase Realtime Database / Firestore (Easy + Realtime)
+
+**How it works:**
+- Store whitelist in Firebase:
+  ```json
+  {
+    "allowedDevices": {
+      "MihirPhone": true,
+      "RaviWatch": true
+    }
+  }
+  ```
+- ESP32 uses Firebase ESP32 client library to read and listen for changes
+
+**Pros:** Real-time updates, easy mobile SDK integration, Firebase handles auth/rules  
+**Cons:** Requires Firebase setup, library overhead on ESP32  
+**Best for:** When using Firebase for the entire backend (app + attendance logs)
+
+### Option 4: MQTT Topic (For Multiple ESPs)
+
+**How it works:**
+- Publish whitelist updates to MQTT topic `/config/allowed-devices`
+- ESP subscribes to this topic and updates whitelist on message receive
+- Use retained messages so new ESPs get the last value on connect
+
+**Pros:** Real-time, lightweight, scales to many ESP devices  
+**Cons:** Requires MQTT broker setup  
+**Best for:** Large deployments with many ESP nodes
+
+### Recommended caching & fallback pattern (for any option)
+
+1. **At boot**: Attempt to fetch remote whitelist (5-10 second timeout)
+2. **On success**: Parse JSON, validate, update in-memory array, save to SPIFFS as cache
+3. **On failure**: Load from SPIFFS cache; if not present, use compiled fallback array
+4. **Periodic refresh**: Re-fetch every 15-30 minutes (configurable)
+
+**Security:**
+- Use HTTPS for all HTTP requests
+- Add authentication (API key, JWT token, or shared secret)
+- Validate JSON structure and string lengths on ESP to prevent buffer overflows
+
+---
+
+## Better Data Storage (Replace Google Sheets)
+
+Google Sheets works for prototyping but has limitations for production. Here are better alternatives for storing attendance logs that integrate with employee and manager apps:
+
+### Option 1: REST API + Relational Database (PostgreSQL / MySQL)
+
+**Architecture:**
+- Backend API with endpoints:
+  - `POST /api/attendance/log` — ESP submits IN/OUT events
+  - `GET /api/attendance/history?employee_id=X&date=Y` — App queries logs
+  - `GET /api/attendance/today` — Manager dashboard
+- Database stores: employees, attendance_logs, esp_nodes
+
+**Database schema:**
+```sql
+CREATE TABLE employees (
+  id SERIAL PRIMARY KEY,
+  name VARCHAR(100),
+  ble_identifier VARCHAR(50) UNIQUE,
+  email VARCHAR(100),
+  role VARCHAR(50)
+);
+
+CREATE TABLE attendance_logs (
+  id SERIAL PRIMARY KEY,
+  employee_id INT REFERENCES employees(id),
+  action VARCHAR(10), -- 'IN' or 'OUT'
+  timestamp TIMESTAMPTZ DEFAULT NOW(),
+  esp_node_id VARCHAR(50),
+  CONSTRAINT valid_action CHECK (action IN ('IN', 'OUT'))
+);
+
+CREATE INDEX idx_attendance_employee_date ON attendance_logs(employee_id, DATE(timestamp));
+```
+
+**ESP32 changes:**
+- Change `logToGoogleSheet()` to POST JSON:
+  ```json
+  {
+    "device": "MihirPhone",
+    "action": "IN",
+    "esp_node_id": "ESP32_001"
+  }
+  ```
+- Add retry logic and local buffering in SPIFFS if POST fails
+
+**App integration:**
+- **Employee view**: Query `/api/attendance/history?employee_id=123` to show personal attendance
+- **Manager view**: Query `/api/attendance/today` or `/api/reports/monthly` for team overview
+- Export to CSV/PDF for reports
+
+**Pros:** Full control, complex queries, relational integrity, scales well  
+**Cons:** Requires backend development, hosting, and maintenance  
+**Best for:** Production systems, enterprise
+
+### Option 2: Firebase (Firestore or Realtime Database)
+
+**Architecture:**
+- ESP logs events to Firebase
+- Mobile app reads from same Firebase database
+- Use Firebase security rules to control access (employees see only their data, managers see all)
+
+**Firestore schema:**
+```javascript
+/attendance/{logId}: {
+  employee_id: "MihirPhone",
+  action: "IN",
+  timestamp: Timestamp,
+  esp_node_id: "ESP32_001"
+}
+
+/employees/{employeeId}: {
+  name: "Mihir",
+  ble_identifier: "MihirPhone",
+  role: "employee"
+}
+```
+
+**ESP32 changes:**
+- Use Firebase ESP32 Client library
+- Push attendance events to `/attendance` collection
+
+**App integration:**
+- **Employee view**: Query Firestore where `employee_id == currentUser.ble_identifier`
+- **Manager view**: Query all documents with date filters
+- Real-time updates: use Firestore listeners for live dashboard
+
+**Pros:** Real-time sync, easy mobile integration, no backend code needed, Firebase Auth  
+**Cons:** Learning curve, vendor lock-in, costs scale with usage  
+**Best for:** Startups, rapid prototyping, real-time dashboards
+
+### Option 3: Self-hosted TimescaleDB (PostgreSQL extension for time-series)
+
+**Why TimescaleDB:**
+- Optimized for time-series data (attendance logs are time-series by nature)
+- Automatic partitioning and fast queries for date ranges
+- Drop-in PostgreSQL replacement
+
+**Schema:**
+```sql
+CREATE TABLE attendance_logs (
+  time TIMESTAMPTZ NOT NULL,
+  employee_id INT,
+  action VARCHAR(10),
+  esp_node_id VARCHAR(50)
+);
+
+SELECT create_hypertable('attendance_logs', 'time');
+```
+
+**Pros:** Excellent for analytics, fast queries, open-source  
+**Cons:** Requires PostgreSQL knowledge and hosting  
+**Best for:** Large scale, analytics-heavy systems
+
+### Option 4: Supabase (Firebase alternative, open-source)
+
+**What is Supabase:**
+- Open-source Firebase alternative built on PostgreSQL
+- Provides REST API, real-time subscriptions, and authentication
+- Self-hostable or use their cloud hosting
+
+**ESP32 changes:**
+- POST to Supabase REST API: `/rest/v1/attendance_logs`
+- Use API key or JWT for auth
+
+**App integration:**
+- Use Supabase client SDKs (JavaScript, Dart/Flutter, Swift)
+- Real-time subscriptions for live updates
+- Built-in auth and row-level security
+
+**Pros:** Open-source, PostgreSQL power, real-time, generous free tier  
+**Cons:** Smaller ecosystem than Firebase  
+**Best for:** Teams wanting Firebase-like features with SQL database
+
+### Comparison: Data Storage Options
+
+| Feature | Google Sheets | REST + Postgres | Firebase | Supabase |
+|---------|---------------|-----------------|----------|----------|
+| Setup Complexity | Very Low | High | Medium | Medium |
+| Real-time Updates | No | No (unless websockets) | Yes | Yes |
+| Scalability | Low | High | High | High |
+| Query Flexibility | Low | High | Medium | High |
+| Cost (10k logs/month) | Free | ~$5-20 | ~$0-25 | Free-$25 |
+| Employee App Integration | Hard | Easy | Easy | Easy |
+| Manager Dashboard | Manual | Custom | Custom | Custom |
+| Analytics/Reports | Limited | Excellent | Good | Excellent |
+
+### Recommended Architecture (Production-ready)
+
+**Backend:**
+- REST API (Node.js/Express or Python/Flask)
+- PostgreSQL database (or Supabase)
+- Hosted on DigitalOcean, AWS, or Heroku
+
+**ESP32:**
+- Fetches whitelist from `/api/allowed-devices` every 15 min
+- POSTs attendance events to `/api/attendance/log` with retry + buffering
+- Stores failed requests in SPIFFS circular buffer (max 100 events)
+
+**Mobile App (Employee):**
+- React Native or Flutter
+- Login with email/password (JWT auth)
+- Fetch assigned BLE identifier from `/api/employees/me`
+- Start BLE advertising with that identifier
+- View personal attendance: GET `/api/attendance/history?employee_id=me`
+- Show today's IN/OUT times, weekly summary
+
+**Web Dashboard (Manager):**
+- React + Chart.js or similar
+- View all employees' attendance today: GET `/api/attendance/today`
+- Filters by date range, employee, export CSV
+- Analytics: late arrivals, early departures, total hours
+
+**Security:**
+- HTTPS everywhere
+- JWT tokens for app authentication
+- ESP uses API key (stored in firmware, rotatable via OTA)
+- Rate limiting on all endpoints
+- Database backup and logging
+
+---
+
+## Developer Handoff Checklist
+
+### Immediate tasks (before app development)
+1. ✅ Review `ble_attendance.ino` and test current Google Sheets logging
+2. ⬜ Add `SECRET_KEY` parameter to Google Apps Script logging (quick security win)
+3. ⬜ Decide on data storage backend (Firebase vs REST API vs Supabase)
+4. ⬜ Design database schema for employees and attendance_logs
+5. ⬜ Implement backend API endpoints (whitelist + logging)
+
+### ESP32 firmware updates (in parallel with backend)
+1. ⬜ Add dynamic whitelist fetching (HTTP GET + JSON parsing)
+2. ⬜ Implement SPIFFS caching and fallback logic
+3. ⬜ Change logging to POST JSON instead of GET query params
+4. ⬜ Add retry logic and local buffering for failed requests
+5. ⬜ Add `esp_node_id` and `firmware_version` to logs
+6. ⬜ Implement OTA updates for remote firmware management
+
+### Mobile app development
+1. ⬜ Choose framework (React Native vs Flutter vs Native)
+2. ⬜ Implement BLE advertising with "Complete Local Name"
+3. ⬜ Test advertising on Android and iOS with nRF Connect → ESP32
+4. ⬜ Implement authentication (login, JWT storage)
+5. ⬜ Fetch employee's BLE identifier from backend
+6. ⬜ Build employee attendance view (today's IN/OUT, history)
+7. ⬜ Handle background advertising and permissions
+8. ⬜ Add notifications (e.g., "You've been marked IN")
+
+### Manager dashboard (web or mobile)
+1. ⬜ Build authentication (separate manager role)
+2. ⬜ Implement team attendance view (all employees, today)
+3. ⬜ Add filters: date range, employee name, action (IN/OUT)
+4. ⬜ Export attendance reports (CSV, PDF)
+5. ⬜ Analytics: late arrivals, total hours, monthly summaries
+6. ⬜ Manage whitelist (add/remove employees, assign BLE identifiers)
+
+### Testing & deployment
+1. ⬜ Test ESP32 with multiple phones advertising simultaneously
+2. ⬜ Test walk-in/walk-out detection with different scan intervals
+3. ⬜ Test offline buffering and retry logic
+4. ⬜ Load test backend API (simulate 50+ employees, 1000 events/day)
+5. ⬜ Test app battery consumption with continuous advertising
+6. ⬜ Deploy backend to production (with monitoring and backups)
+7. ⬜ Document deployment (Wi-Fi config, API keys, OTA process)
+
+---
+
+## Quick Start (Current System)
+
+### ESP32 Setup
+1. Install Arduino IDE and ESP32 board support
+2. Install libraries: `WiFi`, `HTTPClient`, `BLEDevice` (built-in on ESP32)
+3. Open `ble_attendance.ino`
+4. Edit:
+   - `WIFI_SSID` and `WIFI_PASS`
+   - `GOOGLE_SCRIPT_URL` (your Apps Script web app URL)
+   - `allowedDevices[]` array
+5. Upload to ESP32
+6. Open Serial Monitor (115200 baud) to see logs
+
+### Google Apps Script Setup (Current)
+1. Create a Google Sheet with columns: `Timestamp`, `Device`, `Action`
+2. Go to Extensions → Apps Script
+3. Paste:
+   ```javascript
+   function doGet(e) {
+     const sheet = SpreadsheetApp.getActiveSheet();
+     const device = e.parameter.device;
+     const action = e.parameter.action;
+     sheet.appendRow([new Date(), device, action]);
+     return ContentService.createTextOutput('OK');
+   }
+   ```
+4. Deploy as Web App (Anyone can access)
+5. Copy the web app URL to `GOOGLE_SCRIPT_URL` in the sketch
+
+### Testing with nRF Connect
+1. Install nRF Connect app on phone
+2. Go to Advertiser tab → Create advertiser
+3. Set "Complete Local Name" to a name from `allowedDevices[]` (e.g., "MihirPhone")
+4. Enable "Connectable" and "Discoverable"
+5. Start advertising
+6. Check ESP32 Serial Monitor for "Walk-IN detected"
+7. Stop advertising and verify "Walk-OUT detected"
+
+---
+
+## Technical Notes
+
+### BLE Advertisement Packet Structure
+- The ESP scans for BLE advertisement packets (not connections)
+- Relevant field: **Complete Local Name** (0x09) or **Shortened Local Name** (0x08)
+- Current code uses `advertisedDevice.getName()` which extracts this field
+- Some devices don't advertise names by default; app must explicitly include it
+
+### Timing & Sensitivity
+- `scanTime = 5` seconds: how long each scan runs
+- `delay(3000)` between scans: 3-second pause
+- Total cycle: ~8 seconds
+- A device must be absent for one full scan to trigger "Walk-OUT"
+- Adjust these values for environment (larger offices may need longer scans)
+
+### Power Consumption (ESP32)
+- Active BLE scanning: ~80-100mA
+- Wi-Fi active: ~100-150mA
+- Idle (between scans): ~30-40mA
+- Use deep sleep between scans to reduce power if battery-powered
+
+### Scaling (Multiple ESPs)
+- For large offices, deploy multiple ESP32 nodes
+- Each node should have a unique `esp_node_id`
+- Backend can track which ESP detected the employee (useful for zone-based attendance)
+
+---
+
+## Support & Contact
+
+For implementation questions or to request specific features (Firebase integration, REST API example, mobile app starter code), contact the project maintainer or open an issue in the repository.
+
+**Next recommended step**: Choose a backend (Supabase or REST API), implement the endpoints, then update the ESP firmware to use dynamic whitelist + improved logging.
+
 - Pros: Fast to set up, no server, familiar UI.
 - Cons: Not real-time, rate limits, weak security, not for large scale.
 - Complexity: Very low.
